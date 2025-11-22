@@ -1,6 +1,8 @@
+mod capture;
 mod chat;
 
 use anyhow::{Context, Result};
+use capture::CommandCapture;
 use chat::{ChatLoopResult, ChatState};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -9,6 +11,7 @@ use crossterm::{
 };
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use ratatui::{backend::CrosstermBackend, Terminal};
+use std::fs;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,9 +43,36 @@ fn main() -> Result<()> {
         })
         .context("Failed to create PTY")?;
 
-    // Spawn zsh shell in current working directory
+    // Create temporary directory for zsh hooks
+    let temp_dir = std::env::temp_dir().join(format!("petoncle-{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).context("Failed to create temp dir for hooks")?;
+
+    // Create temporary .zshrc with our hooks + source user's real config
+    let temp_zshrc = temp_dir.join(".zshrc");
+    let zsh_hooks_content = r#"# Petoncle command tracking hooks
+preexec() {
+    # Called before command execution with the full command
+    # OSC 133;C marks command start
+    printf '\033]133;C;%s\007' "$1"
+}
+
+precmd() {
+    # Called after command execution, before prompt
+    # OSC 133;D marks command end with exit code
+    printf '\033]133;D;%s\007' "$?"
+}
+
+# Source user's real .zshrc if it exists
+if [ -f "$HOME/.zshrc" ]; then
+    source "$HOME/.zshrc"
+fi
+"#;
+    fs::write(&temp_zshrc, zsh_hooks_content).context("Failed to write temp .zshrc")?;
+
+    // Spawn zsh shell with ZDOTDIR pointing to our temp directory
     let mut cmd = CommandBuilder::new("zsh");
     cmd.env("TERM", "xterm-256color");
+    cmd.env("ZDOTDIR", &temp_dir); // zsh will load .zshrc from here
 
     // Start in the same directory where Petoncle was launched
     if let Ok(cwd) = std::env::current_dir() {
@@ -76,6 +106,10 @@ fn main() -> Result<()> {
     let chat_state = Arc::new(Mutex::new(ChatState::new()));
     let chat_state_clone = chat_state.clone();
 
+    // Create command capture system
+    let command_capture = Arc::new(Mutex::new(CommandCapture::new()));
+    let command_capture_clone = command_capture.clone();
+
     // Enable raw mode for proper terminal handling
     enable_raw_mode().context("Failed to enable raw mode")?;
 
@@ -95,6 +129,15 @@ fn main() -> Result<()> {
                 }
                 Ok(n) => {
                     let data = &buf[..n];
+
+                    // Convert bytes to string for command capture
+                    if let Ok(text) = std::str::from_utf8(data) {
+                        // Process output for command capture with OSC 133 sequences
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        if let Ok(mut capture) = command_capture_clone.lock() {
+                            capture.process_output(text, &cwd);
+                        }
+                    }
 
                     // Store in buffer for RAG (will be used later)
                     if let Ok(mut buffer) = output_buffer_clone.lock() {
@@ -121,7 +164,7 @@ fn main() -> Result<()> {
     });
 
     // Main input loop (handles both terminal and chat mode)
-    let input_loop_result = input_loop(writer_clone, running_clone2, output_paused, chat_state_clone);
+    let input_loop_result = input_loop(writer_clone, running_clone2, output_paused, chat_state_clone, command_capture);
 
     // Cleanup
     running.store(false, Ordering::Relaxed);
@@ -132,6 +175,12 @@ fn main() -> Result<()> {
     output_thread.join().ok();
 
     let exit_status = child.wait()?;
+
+    // Cleanup temporary directory
+    if let Err(e) = fs::remove_dir_all(&temp_dir) {
+        eprintln!("Warning: Failed to cleanup temp dir: {}", e);
+    }
+
     println!("\n🐚 Shell exited with status: {:?}", exit_status);
 
     input_loop_result
@@ -143,7 +192,11 @@ fn input_loop(
     running: Arc<AtomicBool>,
     output_paused: Arc<AtomicBool>,
     chat_state: Arc<Mutex<ChatState>>,
+    _command_capture: Arc<Mutex<CommandCapture>>,
 ) -> Result<()> {
+    // Note: Command capture now happens via zsh hooks (preexec/precmd)
+    // No need to track keystrokes manually
+
     loop {
         if !running.load(Ordering::Relaxed) {
             break;
@@ -188,6 +241,7 @@ fn input_loop(
                     }
 
                     // Convert crossterm key event to bytes and send to PTY
+                    // Command tracking is now done via zsh hooks (preexec/precmd)
                     let bytes = key_event_to_bytes(key_event);
                     if !bytes.is_empty() {
                         if let Ok(mut w) = writer.lock() {
