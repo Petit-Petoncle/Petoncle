@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::io::Stdout;
@@ -30,10 +30,14 @@ pub struct ChatState {
     pub input: String,
     pub cursor_position: usize,
     pub extracted_commands: Vec<String>, // Commands extracted from last AI response
+    pub scroll_state: ListState, // For scrolling through messages
 }
 
 impl ChatState {
     pub fn new() -> Self {
+        let mut scroll_state = ListState::default();
+        scroll_state.select(Some(0)); // Select first message
+
         Self {
             messages: vec![ChatMessage {
                 role: MessageRole::Assistant,
@@ -43,6 +47,14 @@ impl ChatState {
             input: String::new(),
             cursor_position: 0,
             extracted_commands: Vec::new(),
+            scroll_state,
+        }
+    }
+
+    /// Scroll to the latest message
+    pub fn scroll_to_bottom(&mut self) {
+        if !self.messages.is_empty() {
+            self.scroll_state.select(Some(self.messages.len() - 1));
         }
     }
 
@@ -52,6 +64,7 @@ impl ChatState {
             content,
             timestamp: Local::now(),
         });
+        self.scroll_to_bottom();
     }
 
     pub fn add_assistant_message(&mut self, content: String) {
@@ -63,6 +76,7 @@ impl ChatState {
             content,
             timestamp: Local::now(),
         });
+        self.scroll_to_bottom();
     }
 
     pub fn clear_input(&mut self) {
@@ -187,7 +201,7 @@ fn extract_commands(text: &str) -> Vec<String> {
 /// Render the chat overlay UI
 pub fn render_chat_ui(
     frame: &mut Frame,
-    state: &ChatState,
+    state: &mut ChatState,
     area: Rect,
 ) {
     // Create a centered popup area (80% width, 70% height)
@@ -212,8 +226,8 @@ pub fn render_chat_ui(
         .constraints(constraints)
         .split(popup_area);
 
-    // Render messages
-    let messages: Vec<ListItem> = state
+    // Render messages (we'll calculate which ones to show based on available height)
+    let all_messages: Vec<ListItem> = state
         .messages
         .iter()
         .map(|msg| {
@@ -245,17 +259,18 @@ pub fn render_chat_ui(
         })
         .collect();
 
-    let messages_list = List::new(messages)
+    let messages_list = List::new(all_messages)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title("💬 Petoncle Chat (ESC pour quitter)")
+                .title("💬 Petoncle Chat (↑↓ pour scroller, ESC pour quitter)")
                 .title_alignment(Alignment::Center),
         )
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(Color::Black))
+        .highlight_style(Style::default().bg(Color::DarkGray));
 
-    frame.render_widget(messages_list, chunks[0]);
+    frame.render_stateful_widget(messages_list, chunks[0], &mut state.scroll_state);
 
     let mut next_chunk = 1;
 
@@ -331,6 +346,20 @@ pub fn run_chat_loop(
                     KeyCode::Esc => {
                         // Exit chat mode
                         return Ok(ChatLoopResult::Closed);
+                    }
+                    KeyCode::Up => {
+                        // Scroll up in message history
+                        let selected = state.scroll_state.selected().unwrap_or(0);
+                        if selected > 0 {
+                            state.scroll_state.select(Some(selected - 1));
+                        }
+                    }
+                    KeyCode::Down => {
+                        // Scroll down in message history
+                        let selected = state.scroll_state.selected().unwrap_or(0);
+                        if selected < state.messages.len().saturating_sub(1) {
+                            state.scroll_state.select(Some(selected + 1));
+                        }
                     }
                     KeyCode::Char(c) if c.is_ascii_digit() => {
                         // Check if it's a command number (1-9)

@@ -40,9 +40,14 @@ fn main() -> Result<()> {
         })
         .context("Failed to create PTY")?;
 
-    // Spawn zsh shell
+    // Spawn zsh shell in current working directory
     let mut cmd = CommandBuilder::new("zsh");
     cmd.env("TERM", "xterm-256color");
+
+    // Start in the same directory where Petoncle was launched
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
 
     let mut child = pair
         .slave
