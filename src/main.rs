@@ -1,5 +1,6 @@
 mod capture;
 mod chat;
+mod grpc_client;
 
 use anyhow::{Context, Result};
 use capture::CommandCapture;

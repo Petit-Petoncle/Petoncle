@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package petoncle;
+
+// Chat service for AI-powered terminal assistance
+service ChatService {
+  // Send a message and get AI response
+  rpc SendMessage(ChatRequest) returns (ChatResponse);
+}
+
+// Request message containing user input
+message ChatRequest {
+  string message = 1;
+  repeated string context = 2; // Optional: command history for context
+}
+
+// Response message containing AI reply
+message ChatResponse {
+  string message = 1;
+  repeated string commands = 2; // Optional: extracted commands
+}

@@ -6,11 +6,14 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::io::Stdout;
 use std::time::Duration;
+use tokio::runtime::Runtime;
+
+use crate::grpc_client::AgentClient;
 
 #[derive(Debug, Clone)]
 pub enum MessageRole {
@@ -30,32 +33,36 @@ pub struct ChatState {
     pub input: String,
     pub cursor_position: usize,
     pub extracted_commands: Vec<String>, // Commands extracted from last AI response
-    pub scroll_state: ListState, // For scrolling through messages
+    pub scroll_offset: u16, // Scroll position (line-based)
+    grpc_client: AgentClient,
+    runtime: Runtime,
 }
 
 impl ChatState {
     pub fn new() -> Self {
-        let mut scroll_state = ListState::default();
-        scroll_state.select(Some(0)); // Select first message
+        // Initialize gRPC client and tokio runtime
+        let grpc_client = AgentClient::new("127.0.0.1:50051");
+        let runtime = Runtime::new().expect("Failed to create tokio runtime");
 
         Self {
             messages: vec![ChatMessage {
                 role: MessageRole::Assistant,
-                content: "👋 Bienvenue dans Petoncle!\n\nInterface chat opérationnelle.\nLe backend IA sera connecté dans une prochaine version.\n\n💡 Tu peux tester l'interface en tapant des messages.".to_string(),
+                content: "👋 Bienvenue dans Petoncle!\n\n🤖 Connexion au service IA en cours...\n💡 Appuyez sur ESC pour fermer".to_string(),
                 timestamp: Local::now(),
             }],
             input: String::new(),
             cursor_position: 0,
             extracted_commands: Vec::new(),
-            scroll_state,
+            scroll_offset: 0,
+            grpc_client,
+            runtime,
         }
     }
 
-    /// Scroll to the latest message
+    /// Scroll to the latest message (bottom of chat)
     pub fn scroll_to_bottom(&mut self) {
-        if !self.messages.is_empty() {
-            self.scroll_state.select(Some(self.messages.len() - 1));
-        }
+        // Set to a very large value to scroll to bottom
+        self.scroll_offset = u16::MAX;
     }
 
     pub fn add_user_message(&mut self, content: String) {
@@ -64,19 +71,16 @@ impl ChatState {
             content,
             timestamp: Local::now(),
         });
-        self.scroll_to_bottom();
+        // Don't auto-scroll, let user scroll manually with ↑↓
     }
 
     pub fn add_assistant_message(&mut self, content: String) {
-        // Extract commands from the response
-        self.extracted_commands = extract_commands(&content);
-
         self.messages.push(ChatMessage {
             role: MessageRole::Assistant,
             content,
             timestamp: Local::now(),
         });
-        self.scroll_to_bottom();
+        // Don't auto-scroll, let user scroll manually with ↑↓
     }
 
     pub fn clear_input(&mut self) {
@@ -84,14 +88,38 @@ impl ChatState {
         self.cursor_position = 0;
     }
 
-    /// Placeholder response until AI backend is connected
-    pub fn generate_placeholder_response(&self, _user_input: &str) -> String {
-        "🤖 Backend IA non connecté.\n\n\
-         L'interface chat est fonctionnelle mais le service d'agents Python n'est pas encore implémenté.\n\n\
-         Prochaines étapes:\n\
-         • gRPC communication Rust ↔ Python\n\
-         • Agent service avec LangGraph\n\
-         • RAG avec ChromaDB".to_string()
+    /// Generate AI response using gRPC service
+    pub fn generate_response(&mut self, user_input: &str) -> String {
+        eprintln!("[CHAT] Sending message to gRPC service...");
+
+        // Try to call gRPC service
+        let result = self.runtime.block_on(async {
+            self.grpc_client
+                .send_message(user_input.to_string(), vec![])
+                .await
+        });
+
+        match result {
+            Ok(response) => {
+                eprintln!("[CHAT] Received response: {} bytes, {} commands",
+                         response.message.len(), response.commands.len());
+
+                // Update extracted commands from response
+                self.extracted_commands = response.commands;
+                response.message
+            }
+            Err(e) => {
+                // Fallback to placeholder if service unavailable
+                eprintln!("[CHAT] gRPC error: {}", e);
+                format!(
+                    "⚠️ Service IA non disponible\n\n\
+                     Erreur: {}\n\n\
+                     💡 Assurez-vous que le service Python est démarré:\n\
+                     cd python && python agent_service.py",
+                    e
+                )
+            }
+        }
     }
 }
 
@@ -178,40 +206,41 @@ pub fn render_chat_ui(
         .constraints(constraints)
         .split(popup_area);
 
-    // Render messages (we'll calculate which ones to show based on available height)
-    let all_messages: Vec<ListItem> = state
-        .messages
-        .iter()
-        .map(|msg| {
-            let time = msg.timestamp.format("%H:%M:%S");
-            let (prefix, style) = match msg.role {
-                MessageRole::User => (
-                    "🧑 You",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                MessageRole::Assistant => (
-                    "🤖 Petoncle",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                ),
-            };
+    // Build a single text with all messages (line by line)
+    let mut lines: Vec<Line> = Vec::new();
 
-            let header = Line::from(vec![
-                Span::styled(prefix, style),
-                Span::raw(format!(" • {}", time)),
-            ]);
+    for msg in &state.messages {
+        let time = msg.timestamp.format("%H:%M:%S");
+        let (prefix, style) = match msg.role {
+            MessageRole::User => (
+                "🧑 You",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            MessageRole::Assistant => (
+                "🤖 Petoncle",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+        };
 
-            // Split content into lines
-            let mut lines = vec![header, Line::from("")];
-            for line in msg.content.lines() {
-                lines.push(Line::from(line.to_string()));
-            }
-            lines.push(Line::from(""));
+        // Add header
+        lines.push(Line::from(vec![
+            Span::styled(prefix, style),
+            Span::raw(format!(" • {}", time)),
+        ]));
+        lines.push(Line::from(""));
 
-            ListItem::new(lines)
-        })
-        .collect();
+        // Add content (no truncation, full message)
+        for line in msg.content.lines() {
+            lines.push(Line::from(line.to_string()));
+        }
 
-    let messages_list = List::new(all_messages)
+        lines.push(Line::from(""));
+        lines.push(Line::from("───────────────────────────────────"));
+        lines.push(Line::from(""));
+    }
+
+    // Create Paragraph with scroll
+    let messages_paragraph = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -220,9 +249,10 @@ pub fn render_chat_ui(
                 .title_alignment(Alignment::Center),
         )
         .style(Style::default().bg(Color::Black))
-        .highlight_style(Style::default().bg(Color::DarkGray));
+        .wrap(Wrap { trim: false })
+        .scroll((state.scroll_offset, 0));
 
-    frame.render_stateful_widget(messages_list, chunks[0], &mut state.scroll_state);
+    frame.render_widget(messages_paragraph, chunks[0]);
 
     let mut next_chunk = 1;
 
@@ -300,18 +330,12 @@ pub fn run_chat_loop(
                         return Ok(ChatLoopResult::Closed);
                     }
                     KeyCode::Up => {
-                        // Scroll up in message history
-                        let selected = state.scroll_state.selected().unwrap_or(0);
-                        if selected > 0 {
-                            state.scroll_state.select(Some(selected - 1));
-                        }
+                        // Scroll up
+                        state.scroll_offset = state.scroll_offset.saturating_sub(1);
                     }
                     KeyCode::Down => {
-                        // Scroll down in message history
-                        let selected = state.scroll_state.selected().unwrap_or(0);
-                        if selected < state.messages.len().saturating_sub(1) {
-                            state.scroll_state.select(Some(selected + 1));
-                        }
+                        // Scroll down
+                        state.scroll_offset = state.scroll_offset.saturating_add(1);
                     }
                     KeyCode::Char(c) if c.is_ascii_digit() => {
                         // Check if it's a command number (1-9)
@@ -333,8 +357,8 @@ pub fn run_chat_loop(
                             state.add_user_message(user_message.clone());
                             state.clear_input();
 
-                            // Generate placeholder response (AI not connected yet)
-                            let response = state.generate_placeholder_response(&user_message);
+                            // Generate AI response via gRPC
+                            let response = state.generate_response(&user_message);
                             state.add_assistant_message(response);
                         }
                     }

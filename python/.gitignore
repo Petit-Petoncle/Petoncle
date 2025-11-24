@@ -1,0 +1,17 @@
+# Virtual environment
+bin/
+lib/
+include/
+pyvenv.cfg
+
+# Environment variables
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated protobuf
+proto/*_pb2.py
+proto/*_pb2_grpc.py

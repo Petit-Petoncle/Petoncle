@@ -97,11 +97,9 @@ impl CommandCapture {
         if let Some(start) = data.find("\x1b]133;C;") {
             if let Some(end) = data[start..].find('\x07') {
                 let command = &data[start + 8..start + end];
-                eprintln!("\n[HOOK] preexec: {:?}", command);
 
                 // Start new command capture
                 if let Some(cmd) = self.current_command.take() {
-                    eprintln!("[CAPTURE] ✓ {:?} → {} bytes captured", cmd.command, cmd.output.len());
                     self.commands.push(cmd);
                 }
                 self.current_command = Some(CapturedCommand::new(command.to_string(), working_dir.to_path_buf()));
@@ -113,7 +111,6 @@ impl CommandCapture {
             if let Some(end) = data[start..].find('\x07') {
                 let exit_code_str = &data[start + 8..start + end];
                 if let Ok(exit_code) = exit_code_str.parse::<i32>() {
-                    eprintln!("[HOOK] precmd: exit_code={}", exit_code);
                     if let Some(ref mut cmd) = self.current_command {
                         cmd.set_exit_code(exit_code);
                     }
@@ -180,7 +177,6 @@ impl CommandCapture {
     pub fn start_command(&mut self, command: String, working_dir: PathBuf) {
         // If there was a previous command, finalize it
         if let Some(cmd) = self.current_command.take() {
-            eprintln!("[CAPTURE] ✓ {:?} → {} bytes captured", cmd.command, cmd.output.len());
             self.commands.push(cmd);
         }
 
