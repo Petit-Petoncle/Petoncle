@@ -10,7 +10,9 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io::Stdout;
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 
 use crate::grpc_client::AgentClient;
@@ -22,18 +24,31 @@ pub enum MessageRole {
 }
 
 #[derive(Debug, Clone)]
+pub enum MessageState {
+    Loading,
+    Ready,
+}
+
+#[derive(Debug, Clone)]
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
     pub timestamp: DateTime<Local>,
+    pub state: MessageState,
 }
+
+// Spinner frames for loading animation
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub struct ChatState {
     pub messages: Vec<ChatMessage>,
     pub input: String,
-    pub cursor_position: usize,
-    pub extracted_commands: Vec<String>, // Commands extracted from last AI response
     pub scroll_offset: u16, // Scroll position (line-based)
+    pub auto_scroll: bool, // Auto-scroll to bottom on new message
+    pub last_visible_height: u16, // Last known visible height of messages area
+    pub spinner_frame: usize, // Current spinner frame index
+    pub last_spinner_update: Instant, // Last time spinner was updated
+    pub response_receiver: Option<Receiver<Result<String>>>, // Channel to receive async responses
     grpc_client: AgentClient,
     runtime: Runtime,
 }
@@ -49,20 +64,70 @@ impl ChatState {
                 role: MessageRole::Assistant,
                 content: "👋 Bienvenue dans Petoncle!\n\n🤖 Connexion au service IA en cours...\n💡 Appuyez sur ESC pour fermer".to_string(),
                 timestamp: Local::now(),
+                state: MessageState::Ready,
             }],
             input: String::new(),
-            cursor_position: 0,
-            extracted_commands: Vec::new(),
             scroll_offset: 0,
+            auto_scroll: true,
+            last_visible_height: 20, // Default fallback
+            spinner_frame: 0,
+            last_spinner_update: Instant::now(),
+            response_receiver: None,
             grpc_client,
             runtime,
         }
     }
 
+    /// Calculate total number of lines in all messages
+    fn count_total_lines(&self) -> usize {
+        let mut count = 0;
+        for msg in &self.messages {
+            count += 1; // Header line
+            count += 1; // Empty line after header
+            count += msg.content.lines().count();
+            count += 1; // Empty line
+            count += 1; // Separator
+            count += 1; // Empty line after separator
+        }
+        count
+    }
+
     /// Scroll to the latest message (bottom of chat)
-    pub fn scroll_to_bottom(&mut self) {
-        // Set to a very large value to scroll to bottom
-        self.scroll_offset = u16::MAX;
+    pub fn scroll_to_bottom(&mut self, visible_height: u16) {
+        let total_lines = self.count_total_lines();
+        let visible = visible_height as usize;
+
+        // Scroll to show the last messages
+        if total_lines > visible {
+            self.scroll_offset = total_lines.saturating_sub(visible) as u16;
+        } else {
+            self.scroll_offset = 0;
+        }
+    }
+
+    /// Get maximum scroll offset based on visible height
+    pub fn max_scroll_offset(&self, visible_height: u16) -> u16 {
+        let total_lines = self.count_total_lines();
+        let visible = visible_height as usize;
+
+        if total_lines > visible {
+            total_lines.saturating_sub(visible) as u16
+        } else {
+            0
+        }
+    }
+
+    /// Scroll down by n lines, respecting bounds
+    pub fn scroll_down(&mut self, n: u16, visible_height: u16) {
+        let max_offset = self.max_scroll_offset(visible_height);
+        self.scroll_offset = (self.scroll_offset + n).min(max_offset);
+        self.auto_scroll = false;
+    }
+
+    /// Scroll up by n lines
+    pub fn scroll_up(&mut self, n: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+        self.auto_scroll = false;
     }
 
     pub fn add_user_message(&mut self, content: String) {
@@ -70,8 +135,9 @@ impl ChatState {
             role: MessageRole::User,
             content,
             timestamp: Local::now(),
+            state: MessageState::Ready,
         });
-        // Don't auto-scroll, let user scroll manually with ↑↓
+        self.auto_scroll = true; // Request auto-scroll on next render
     }
 
     pub fn add_assistant_message(&mut self, content: String) {
@@ -79,103 +145,100 @@ impl ChatState {
             role: MessageRole::Assistant,
             content,
             timestamp: Local::now(),
+            state: MessageState::Ready,
         });
-        // Don't auto-scroll, let user scroll manually with ↑↓
+        self.auto_scroll = true; // Request auto-scroll on next render
+    }
+
+    pub fn add_loading_message(&mut self) {
+        self.messages.push(ChatMessage {
+            role: MessageRole::Assistant,
+            content: "Réflexion en cours".to_string(),
+            timestamp: Local::now(),
+            state: MessageState::Loading,
+        });
+        self.auto_scroll = true;
+    }
+
+    pub fn update_last_message(&mut self, content: String) {
+        if let Some(last) = self.messages.last_mut() {
+            last.content = content;
+            last.state = MessageState::Ready;
+            self.auto_scroll = true;
+        }
     }
 
     pub fn clear_input(&mut self) {
         self.input.clear();
-        self.cursor_position = 0;
     }
 
-    /// Generate AI response using gRPC service
-    pub fn generate_response(&mut self, user_input: &str) -> String {
-        eprintln!("[CHAT] Sending message to gRPC service...");
+    /// Start generating AI response asynchronously (non-blocking)
+    pub fn start_generate_response(&mut self, user_input: String) {
+        // Create channel for async communication
+        let (tx, rx): (Sender<Result<String>>, Receiver<Result<String>>) = mpsc::channel();
 
-        // Try to call gRPC service
-        let result = self.runtime.block_on(async {
-            self.grpc_client
-                .send_message(user_input.to_string(), vec![])
-                .await
-        });
+        // Take ownership of grpc_client temporarily
+        let mut client = AgentClient::new("127.0.0.1:50051");
+        std::mem::swap(&mut client, &mut self.grpc_client);
 
-        match result {
-            Ok(response) => {
-                eprintln!("[CHAT] Received response: {} bytes, {} commands",
-                         response.message.len(), response.commands.len());
+        // Spawn thread to handle gRPC call
+        thread::spawn(move || {
+            // Create runtime for this thread
+            let runtime = Runtime::new().unwrap();
 
-                // Update extracted commands from response
-                self.extracted_commands = response.commands;
-                response.message
-            }
-            Err(e) => {
-                // Fallback to placeholder if service unavailable
-                eprintln!("[CHAT] gRPC error: {}", e);
-                format!(
+            let result = runtime.block_on(async {
+                client.send_message(user_input, vec![]).await
+            });
+
+            let response = match result {
+                Ok(resp) => Ok(resp.message),
+                Err(e) => Ok(format!(
                     "⚠️ Service IA non disponible\n\n\
                      Erreur: {}\n\n\
                      💡 Assurez-vous que le service Python est démarré:\n\
                      cd python && python agent_service.py",
                     e
-                )
+                )),
+            };
+
+            // Send result back
+            tx.send(response).ok();
+        });
+
+        // Store receiver
+        self.response_receiver = Some(rx);
+
+        // Add loading message
+        self.add_loading_message();
+    }
+
+    /// Check if response is ready and update message
+    pub fn check_response(&mut self) -> bool {
+        if let Some(ref receiver) = self.response_receiver {
+            if let Ok(result) = receiver.try_recv() {
+                // Response received!
+                match result {
+                    Ok(content) => {
+                        self.update_last_message(content);
+                    }
+                    Err(e) => {
+                        self.update_last_message(format!("❌ Error: {}", e));
+                    }
+                }
+                self.response_receiver = None;
+                return true;
             }
         }
-    }
-}
-
-/// Extract shell commands from AI response text
-/// Looks for lines that appear to be shell commands
-fn extract_commands(text: &str) -> Vec<String> {
-    let mut commands = Vec::new();
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-
-        // Skip empty lines, comments, and explanatory text
-        if trimmed.is_empty()
-            || trimmed.starts_with('#')
-            || trimmed.starts_with("//")
-            || trimmed.starts_with('•')
-            || trimmed.starts_with('-')
-            || trimmed.starts_with("⚠️")
-            || trimmed.starts_with("💡")
-            || trimmed.starts_with("🔍")
-            || trimmed.starts_with("🛡️")
-            || trimmed.starts_with("🔎")
-            || trimmed.starts_with("🔌")
-            || trimmed.ends_with(':')
-            || trimmed.chars().all(|c| !c.is_ascii_alphanumeric())
-        {
-            continue;
-        }
-
-        // Check if it looks like a command (starts with common command names or contains shell syntax)
-        let looks_like_command = trimmed.starts_with("nmap ")
-            || trimmed.starts_with("sqlmap ")
-            || trimmed.starts_with("nc ")
-            || trimmed.starts_with("netcat ")
-            || trimmed.starts_with("curl ")
-            || trimmed.starts_with("wget ")
-            || trimmed.starts_with("grep ")
-            || trimmed.starts_with("find ")
-            || trimmed.starts_with("awk ")
-            || trimmed.starts_with("sed ")
-            || trimmed.starts_with("python ")
-            || trimmed.starts_with("ruby ")
-            || trimmed.starts_with("perl ")
-            || trimmed.contains(" | ")
-            || trimmed.contains(" && ")
-            || trimmed.contains(" || ")
-            || (trimmed.contains('<') && trimmed.contains('>'));
-
-        if looks_like_command {
-            commands.push(trimmed.to_string());
-        }
+        false
     }
 
-    // Limit to 9 commands max (for numeric keybindings 1-9)
-    commands.truncate(9);
-    commands
+    /// Update spinner animation
+    pub fn update_spinner(&mut self) {
+        if self.last_spinner_update.elapsed() > Duration::from_millis(80) {
+            self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+            self.last_spinner_update = Instant::now();
+        }
+    }
 }
 
 /// Render the chat overlay UI
@@ -187,24 +250,27 @@ pub fn render_chat_ui(
     // Create a centered popup area (80% width, 70% height)
     let popup_area = centered_rect(80, 70, area);
 
-    // Calculate constraints based on whether we have commands to show
-    let constraints = if state.extracted_commands.is_empty() {
-        vec![
-            Constraint::Min(0),      // Messages
-            Constraint::Length(3),   // Input box
-        ]
-    } else {
-        vec![
-            Constraint::Min(0),      // Messages
-            Constraint::Length(state.extracted_commands.len() as u16 + 2), // Commands box
-            Constraint::Length(3),   // Input box
-        ]
-    };
-
+    // Split into messages and input sections
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
+        .constraints(vec![
+            Constraint::Min(0),      // Messages
+            Constraint::Length(3),   // Input box
+        ])
         .split(popup_area);
+
+    // Store the actual visible height of the messages area
+    let visible_height = chunks[0].height.saturating_sub(2); // Subtract borders
+    state.last_visible_height = visible_height;
+
+    // Apply auto-scroll if requested (before building lines)
+    if state.auto_scroll {
+        state.scroll_to_bottom(visible_height);
+        state.auto_scroll = false;
+    }
+
+    // Get current spinner frame
+    let current_spinner_frame = state.spinner_frame;
 
     // Build a single text with all messages (line by line)
     let mut lines: Vec<Line> = Vec::new();
@@ -229,9 +295,29 @@ pub fn render_chat_ui(
         ]));
         lines.push(Line::from(""));
 
-        // Add content (no truncation, full message)
-        for line in msg.content.lines() {
-            lines.push(Line::from(line.to_string()));
+        // Add content with spinner animation if loading
+        match msg.state {
+            MessageState::Loading => {
+                let spinner = SPINNER_FRAMES[current_spinner_frame];
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        spinner,
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        &msg.content,
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::raw("..."),
+                ]));
+            }
+            MessageState::Ready => {
+                // Add content (no truncation, full message)
+                for line in msg.content.lines() {
+                    lines.push(Line::from(line.to_string()));
+                }
+            }
         }
 
         lines.push(Line::from(""));
@@ -245,7 +331,7 @@ pub fn render_chat_ui(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title("💬 Petoncle Chat (↑↓ pour scroller, ESC pour quitter)")
+                .title("💬 Petoncle Chat (↑↓ scroller | Home/End haut/bas | ESC quitter)")
                 .title_alignment(Alignment::Center),
         )
         .style(Style::default().bg(Color::Black))
@@ -253,35 +339,6 @@ pub fn render_chat_ui(
         .scroll((state.scroll_offset, 0));
 
     frame.render_widget(messages_paragraph, chunks[0]);
-
-    let mut next_chunk = 1;
-
-    // Render commands box if there are any
-    if !state.extracted_commands.is_empty() {
-        let mut command_lines = vec![];
-        for (i, cmd) in state.extracted_commands.iter().enumerate() {
-            command_lines.push(Line::from(vec![
-                Span::styled(
-                    format!("[{}]", i + 1),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(cmd, Style::default().fg(Color::White)),
-            ]));
-        }
-
-        let commands_widget = Paragraph::new(command_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow))
-                    .title("⚡ Commandes Détectées (Appuyez 1-9 pour envoyer au terminal)"),
-            )
-            .style(Style::default().bg(Color::Black));
-
-        frame.render_widget(commands_widget, chunks[next_chunk]);
-        next_chunk += 1;
-    }
 
     // Render input box
     let input_text = format!("➤ {}", state.input);
@@ -295,13 +352,12 @@ pub fn render_chat_ui(
         .style(Style::default().bg(Color::Black).fg(Color::White))
         .wrap(Wrap { trim: false });
 
-    frame.render_widget(input, chunks[next_chunk]);
+    frame.render_widget(input, chunks[1]);
 }
 
-/// Result of the chat loop - either None (just closed) or Some(command) to execute
+/// Result of the chat loop
 pub enum ChatLoopResult {
     Closed,
-    ExecuteCommand(String),
 }
 
 /// Run the chat overlay loop
@@ -310,6 +366,14 @@ pub fn run_chat_loop(
     state: &mut ChatState,
 ) -> Result<ChatLoopResult> {
     loop {
+        // Check if response is ready
+        state.check_response();
+
+        // Update spinner animation if waiting for response
+        if state.response_receiver.is_some() {
+            state.update_spinner();
+        }
+
         // Render the UI
         terminal.draw(|frame| {
             let area = frame.area();
@@ -321,63 +385,77 @@ pub fn run_chat_loop(
             render_chat_ui(frame, state, area);
         })?;
 
-        // Handle input events
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key_event) = event::read()? {
-                match key_event.code {
-                    KeyCode::Esc => {
-                        // Exit chat mode
-                        return Ok(ChatLoopResult::Closed);
-                    }
-                    KeyCode::Up => {
-                        // Scroll up
-                        state.scroll_offset = state.scroll_offset.saturating_sub(1);
-                    }
-                    KeyCode::Down => {
-                        // Scroll down
-                        state.scroll_offset = state.scroll_offset.saturating_add(1);
-                    }
-                    KeyCode::Char(c) if c.is_ascii_digit() => {
-                        // Check if it's a command number (1-9)
-                        let num = c.to_digit(10).unwrap() as usize;
-                        if num > 0 && num <= state.extracted_commands.len() {
-                            // Return the command to execute
-                            let cmd = state.extracted_commands[num - 1].clone();
-                            return Ok(ChatLoopResult::ExecuteCommand(cmd));
-                        } else {
-                            // Not a valid command number, add to input
-                            state.input.push(c);
-                            state.cursor_position += 1;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        // Send message
-                        if !state.input.is_empty() {
-                            let user_message = state.input.clone();
-                            state.add_user_message(user_message.clone());
-                            state.clear_input();
+        // Use shorter poll timeout when waiting for response (for smoother animation)
+        let poll_timeout = if state.response_receiver.is_some() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(100)
+        };
 
-                            // Generate AI response via gRPC
-                            let response = state.generate_response(&user_message);
-                            state.add_assistant_message(response);
+        // Handle input events
+        if event::poll(poll_timeout)? {
+            match event::read()? {
+                Event::Paste(text) => {
+                    // Handle pasted text
+                    state.input.push_str(&text);
+                }
+                Event::Key(key_event) => {
+                    // Use the last known visible height from render
+                    let visible_height = state.last_visible_height;
+
+                    match key_event.code {
+                        KeyCode::Esc => {
+                            // Exit chat mode
+                            return Ok(ChatLoopResult::Closed);
                         }
-                    }
-                    KeyCode::Char(c) => {
-                        // Add character to input
-                        state.input.push(c);
-                        state.cursor_position += 1;
-                    }
-                    KeyCode::Backspace => {
-                        // Remove character
-                        if !state.input.is_empty() {
-                            state.input.pop();
-                            if state.cursor_position > 0 {
-                                state.cursor_position -= 1;
+                        KeyCode::Up => {
+                            // Scroll up
+                            state.scroll_up(1);
+                        }
+                        KeyCode::Down => {
+                            // Scroll down with bounds check
+                            state.scroll_down(1, visible_height);
+                        }
+                        KeyCode::PageUp => {
+                            // Scroll up by page (10 lines)
+                            state.scroll_up(10);
+                        }
+                        KeyCode::PageDown => {
+                            // Scroll down by page (10 lines)
+                            state.scroll_down(10, visible_height);
+                        }
+                        KeyCode::Home => {
+                            // Jump to top
+                            state.scroll_offset = 0;
+                            state.auto_scroll = false;
+                        }
+                        KeyCode::End => {
+                            // Jump to bottom
+                            state.auto_scroll = true; // Trigger auto-scroll on next render
+                        }
+                        KeyCode::Enter => {
+                            // Send message
+                            if !state.input.is_empty() && state.response_receiver.is_none() {
+                                let user_message = state.input.clone();
+                                state.add_user_message(user_message.clone());
+                                state.clear_input();
+
+                                // Start generating AI response asynchronously (non-blocking)
+                                state.start_generate_response(user_message);
                             }
                         }
+                        KeyCode::Char(c) => {
+                            // Add character to input
+                            state.input.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            // Remove character
+                            state.input.pop();
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
+                _ => {} // Ignore other events (Mouse, Resize, etc.)
             }
         }
     }

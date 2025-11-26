@@ -47,48 +47,52 @@ class ChatServiceServicer(chat_pb2_grpc.ChatServiceServicer):
             ChatResponse with AI response
         """
         try:
-            logger.info(f"Received message: {request.message[:50]}...")
+            # Validate input
+            if not request.message:
+                logger.warning("Received empty message")
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details("Message cannot be empty")
+                return chat_pb2.ChatResponse(message="⚠️ Message cannot be empty")
+
+            if len(request.message) > 10000:  # 10K char limit
+                logger.warning(f"Message too long: {len(request.message)} chars")
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details("Message too long (max 10000 characters)")
+                return chat_pb2.ChatResponse(message="⚠️ Message too long (max 10000 characters)")
+
+            # Sanitize message (remove null bytes, excessive whitespace)
+            sanitized_message = request.message.replace('\x00', '').strip()
+            if not sanitized_message:
+                logger.warning("Message became empty after sanitization")
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details("Message contains invalid characters")
+                return chat_pb2.ChatResponse(message="⚠️ Message contains invalid characters")
+
+            logger.info(f"Received message: {sanitized_message[:50]}...")
 
             # Get AI response
             response_text = self.agent.chat(
-                message=request.message,
+                message=sanitized_message,
                 context=list(request.context) if request.context else None
             )
 
             logger.info(f"Sending response: {response_text[:50]}...")
 
-            # Extract commands from response (simple heuristic for now)
-            commands = self._extract_commands(response_text)
-
             return chat_pb2.ChatResponse(
                 message=response_text,
-                commands=commands
+                commands=[]  # Command extraction feature removed
             )
 
+        except ValueError as e:
+            logger.error(f"Validation error: {e}")
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(e))
+            return chat_pb2.ChatResponse(message=f"⚠️ Validation error: {e}")
         except Exception as e:
             logger.error(f"Error processing message: {e}")
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
-            return chat_pb2.ChatResponse(message=f"Error: {e}")
-
-    def _extract_commands(self, text: str) -> list[str]:
-        """
-        Extract shell commands from AI response
-
-        Simple heuristic: lines that start with common command names
-        """
-        commands = []
-        command_prefixes = ['nmap', 'sqlmap', 'nc', 'netcat', 'curl', 'wget',
-                          'grep', 'find', 'awk', 'sed', 'python', 'ruby']
-
-        for line in text.split('\n'):
-            trimmed = line.strip()
-            for prefix in command_prefixes:
-                if trimmed.startswith(prefix + ' '):
-                    commands.append(trimmed)
-                    break
-
-        return commands[:9]  # Limit to 9 for UI (1-9 keys)
+            return chat_pb2.ChatResponse(message=f"❌ Error: {e}")
 
 
 def serve(port: int = 50051):

@@ -18,11 +18,38 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 /// Main entry point for Petoncle terminal wrapper
 fn main() -> Result<()> {
+    // Initialize tracing subscriber
+    // Use RUST_LOG environment variable to control log level
+    // Example: RUST_LOG=petoncle=debug cargo run
+    let log_file = std::env::temp_dir().join(format!("petoncle-{}.log", std::process::id()));
+    let log_file_display = log_file.clone();
+
+    let file_layer = fmt::layer()
+        .with_writer(move || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_file)
+                .expect("Failed to open log file")
+        })
+        .with_ansi(false);
+
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("petoncle=info")))
+        .with(file_layer)
+        .init();
+
+    info!("🐚 Petoncle starting - AI-Powered Terminal Wrapper");
+
     println!("🐚 Petoncle - AI-Powered Terminal Wrapper");
     println!("💡 Appuyez sur '!' pour ouvrir le chat AI");
+    println!("📝 Logs: {}", log_file_display.display());
     println!("Starting zsh session...\n");
 
     // Small delay to let message display before raw mode
@@ -30,6 +57,7 @@ fn main() -> Result<()> {
 
     // Get terminal size
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    debug!("Terminal size: {}x{}", cols, rows);
 
     // Get PTY system
     let pty_system = native_pty_system();
@@ -43,29 +71,62 @@ fn main() -> Result<()> {
             pixel_height: 0,
         })
         .context("Failed to create PTY")?;
+    info!("PTY created successfully");
 
     // Create temporary directory for zsh hooks
     let temp_dir = std::env::temp_dir().join(format!("petoncle-{}", std::process::id()));
     fs::create_dir_all(&temp_dir).context("Failed to create temp dir for hooks")?;
+    debug!("Created temp directory: {}", temp_dir.display());
 
     // Create temporary .zshrc with our hooks + source user's real config
     let temp_zshrc = temp_dir.join(".zshrc");
-    let zsh_hooks_content = r#"# Petoncle command tracking hooks
-preexec() {
-    # Called before command execution with the full command
-    # OSC 133;C marks command start
-    printf '\033]133;C;%s\007' "$1"
-}
-
-precmd() {
-    # Called after command execution, before prompt
-    # OSC 133;D marks command end with exit code
-    printf '\033]133;D;%s\007' "$?"
-}
-
-# Source user's real .zshrc if it exists
+    let zsh_hooks_content = r#"# Source user's real .zshrc first (so our hooks don't get overwritten)
 if [ -f "$HOME/.zshrc" ]; then
     source "$HOME/.zshrc"
+fi
+
+# Petoncle command tracking hooks (defined after user config)
+# Use add-zsh-hook if available to avoid overwriting user hooks
+if (( $+functions[add-zsh-hook] )); then
+    # Use add-zsh-hook to add our hooks without overwriting existing ones
+    petoncle_preexec() {
+        # OSC 133;C marks command start
+        printf '\033]133;C;%s\007' "$1"
+    }
+
+    petoncle_precmd() {
+        # OSC 133;D marks command end with exit code
+        printf '\033]133;D;%s\007' "$?"
+    }
+
+    add-zsh-hook preexec petoncle_preexec
+    add-zsh-hook precmd petoncle_precmd
+else
+    # Fallback: save existing hooks and call them
+    if (( $+functions[preexec] )); then
+        functions[_petoncle_user_preexec]=$functions[preexec]
+    fi
+    if (( $+functions[precmd] )); then
+        functions[_petoncle_user_precmd]=$functions[precmd]
+    fi
+
+    preexec() {
+        # Call user's preexec if it exists
+        if (( $+functions[_petoncle_user_preexec] )); then
+            _petoncle_user_preexec "$@"
+        fi
+        # OSC 133;C marks command start
+        printf '\033]133;C;%s\007' "$1"
+    }
+
+    precmd() {
+        # Call user's precmd if it exists
+        if (( $+functions[_petoncle_user_precmd] )); then
+            _petoncle_user_precmd "$@"
+        fi
+        # OSC 133;D marks command end with exit code
+        printf '\033]133;D;%s\007' "$?"
+    }
 fi
 "#;
     fs::write(&temp_zshrc, zsh_hooks_content).context("Failed to write temp .zshrc")?;
@@ -84,6 +145,7 @@ fi
         .slave
         .spawn_command(cmd)
         .context("Failed to spawn zsh")?;
+    info!("zsh shell spawned successfully");
 
     // Get reader and writer from master PTY
     let mut reader = pair.master.try_clone_reader()?;
@@ -125,6 +187,7 @@ fi
             match reader.read(&mut buf) {
                 Ok(0) => {
                     // EOF - shell has exited
+                    info!("Shell exited (EOF received)");
                     running_clone1.store(false, Ordering::Relaxed);
                     break;
                 }
@@ -156,7 +219,8 @@ fi
                         std::io::stdout().flush().ok();
                     }
                 }
-                Err(_) => {
+                Err(e) => {
+                    error!("Error reading from PTY: {:?}", e);
                     running_clone1.store(false, Ordering::Relaxed);
                     break;
                 }
@@ -179,9 +243,12 @@ fi
 
     // Cleanup temporary directory
     if let Err(e) = fs::remove_dir_all(&temp_dir) {
-        eprintln!("Warning: Failed to cleanup temp dir: {}", e);
+        warn!("Failed to cleanup temp dir: {}", e);
+    } else {
+        debug!("Cleaned up temp directory");
     }
 
+    info!("Shell exited with status: {:?}", exit_status);
     println!("\n🐚 Shell exited with status: {:?}", exit_status);
 
     input_loop_result
@@ -213,13 +280,6 @@ fn input_loop(
                     {
                         // Enter chat mode
                         match enter_chat_mode(&output_paused, &chat_state) {
-                            Ok(ChatLoopResult::ExecuteCommand(cmd)) => {
-                                // Send the command to PTY without executing (no Enter)
-                                if let Ok(mut w) = writer.lock() {
-                                    w.write_all(cmd.as_bytes()).ok();
-                                    w.flush().ok();
-                                }
-                            }
                             Ok(ChatLoopResult::Closed) => {
                                 // Just closed, do nothing
                             }
