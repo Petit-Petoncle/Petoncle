@@ -18,4 +18,5 @@ message ChatRequest {
 message ChatResponse {
   string message = 1;
   repeated string commands = 2; // Optional: extracted commands
+  string agent = 3;  // Which agent handled the request (toolsmith, researcher, scribe, general)
 }

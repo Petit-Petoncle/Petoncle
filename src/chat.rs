@@ -35,6 +35,7 @@ pub struct ChatMessage {
     pub content: String,
     pub timestamp: DateTime<Local>,
     pub state: MessageState,
+    pub agent: Option<String>, // Which agent handled this message (toolsmith, researcher, scribe, general)
 }
 
 // Spinner frames for loading animation
@@ -48,7 +49,7 @@ pub struct ChatState {
     pub last_visible_height: u16, // Last known visible height of messages area
     pub spinner_frame: usize, // Current spinner frame index
     pub last_spinner_update: Instant, // Last time spinner was updated
-    pub response_receiver: Option<Receiver<Result<String>>>, // Channel to receive async responses
+    pub response_receiver: Option<Receiver<Result<(String, String)>>>, // Channel to receive async responses (message, agent)
     grpc_client: AgentClient,
     runtime: Runtime,
 }
@@ -65,6 +66,7 @@ impl ChatState {
                 content: "👋 Bienvenue dans Petoncle!\n\n🤖 Connexion au service IA en cours...\n💡 Appuyez sur ESC pour fermer".to_string(),
                 timestamp: Local::now(),
                 state: MessageState::Ready,
+                agent: None,
             }],
             input: String::new(),
             scroll_offset: 0,
@@ -136,16 +138,18 @@ impl ChatState {
             content,
             timestamp: Local::now(),
             state: MessageState::Ready,
+            agent: None, // User messages don't have an agent
         });
         self.auto_scroll = true; // Request auto-scroll on next render
     }
 
-    pub fn add_assistant_message(&mut self, content: String) {
+    pub fn add_assistant_message(&mut self, content: String, agent: Option<String>) {
         self.messages.push(ChatMessage {
             role: MessageRole::Assistant,
             content,
             timestamp: Local::now(),
             state: MessageState::Ready,
+            agent,
         });
         self.auto_scroll = true; // Request auto-scroll on next render
     }
@@ -156,14 +160,16 @@ impl ChatState {
             content: "Réflexion en cours".to_string(),
             timestamp: Local::now(),
             state: MessageState::Loading,
+            agent: None, // Will be set when response is received
         });
         self.auto_scroll = true;
     }
 
-    pub fn update_last_message(&mut self, content: String) {
+    pub fn update_last_message(&mut self, content: String, agent: Option<String>) {
         if let Some(last) = self.messages.last_mut() {
             last.content = content;
             last.state = MessageState::Ready;
+            last.agent = agent;
             self.auto_scroll = true;
         }
     }
@@ -175,7 +181,7 @@ impl ChatState {
     /// Start generating AI response asynchronously (non-blocking)
     pub fn start_generate_response(&mut self, user_input: String) {
         // Create channel for async communication
-        let (tx, rx): (Sender<Result<String>>, Receiver<Result<String>>) = mpsc::channel();
+        let (tx, rx): (Sender<Result<(String, String)>>, Receiver<Result<(String, String)>>) = mpsc::channel();
 
         // Take ownership of grpc_client temporarily
         let mut client = AgentClient::new("127.0.0.1:50051");
@@ -191,14 +197,14 @@ impl ChatState {
             });
 
             let response = match result {
-                Ok(resp) => Ok(resp.message),
-                Err(e) => Ok(format!(
+                Ok(resp) => Ok((resp.message, resp.agent)),
+                Err(e) => Ok((format!(
                     "⚠️ Service IA non disponible\n\n\
                      Erreur: {}\n\n\
                      💡 Assurez-vous que le service Python est démarré:\n\
                      cd python && python agent_service.py",
                     e
-                )),
+                ), "error".to_string())),
             };
 
             // Send result back
@@ -218,11 +224,11 @@ impl ChatState {
             if let Ok(result) = receiver.try_recv() {
                 // Response received!
                 match result {
-                    Ok(content) => {
-                        self.update_last_message(content);
+                    Ok((content, agent)) => {
+                        self.update_last_message(content, Some(agent));
                     }
                     Err(e) => {
-                        self.update_last_message(format!("❌ Error: {}", e));
+                        self.update_last_message(format!("❌ Error: {}", e), Some("error".to_string()));
                     }
                 }
                 self.response_receiver = None;
@@ -288,11 +294,43 @@ pub fn render_chat_ui(
             ),
         };
 
-        // Add header
-        lines.push(Line::from(vec![
+        // Build agent badge if available
+        let agent_badge = if let Some(ref agent) = msg.agent {
+            let (emoji, _) = match agent.as_str() {
+                "toolsmith" => ("🛠️", Color::Yellow),
+                "researcher" => ("🔍", Color::Blue),
+                "scribe" => ("📝", Color::Magenta),
+                "general" => ("🧠", Color::Cyan),
+                "error" => ("⚠️", Color::Red),
+                _ => ("❓", Color::White),
+            };
+            format!(" {} {}", emoji, agent)
+        } else {
+            String::new()
+        };
+
+        // Add header with agent badge
+        let mut header_spans = vec![
             Span::styled(prefix, style),
             Span::raw(format!(" • {}", time)),
-        ]));
+        ];
+        if !agent_badge.is_empty() {
+            if let Some(ref agent) = msg.agent {
+                let (_, color) = match agent.as_str() {
+                    "toolsmith" => ("🛠️", Color::Yellow),
+                    "researcher" => ("🔍", Color::Blue),
+                    "scribe" => ("📝", Color::Magenta),
+                    "general" => ("🧠", Color::Cyan),
+                    "error" => ("⚠️", Color::Red),
+                    _ => ("❓", Color::White),
+                };
+                header_spans.push(Span::styled(
+                    agent_badge,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        lines.push(Line::from(header_spans));
         lines.push(Line::from(""));
 
         // Add content with spinner animation if loading

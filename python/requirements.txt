@@ -2,3 +2,9 @@ grpcio>=1.60.0
 grpcio-tools>=1.60.0
 mistralai>=1.0.0
 python-dotenv>=1.0.0
+
+# Multi-agent system
+langgraph>=0.2.0
+langchain-mistralai>=0.1.0
+langchain-core>=0.3.0
+tavily-python>=0.5.0  # Web search for Researcher
